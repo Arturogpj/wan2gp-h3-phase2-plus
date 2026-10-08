@@ -1,11 +1,11 @@
 {
   "name": "H3 Phase 2+",
   "author": "Community",
-  "version": "1.0.0",
-  "description": "Control MiniMax H3 Two Phases latent-upscale refinement: phase-2 LoRA and strength, step count and start noise (ComfyUI-style schedule).",
+  "version": "1.1.0",
+  "description": "Control MiniMax H3 Two Phases latent-upscale refinement: phase-1 draft size, phase-2 LoRA and strength, step count and start noise (ComfyUI-style schedule).",
   "type": [
     "app"
   ],
-  "date": "2026-09-28",
+  "date": "2026-10-08",
   "wan2gp_version": ""
 }

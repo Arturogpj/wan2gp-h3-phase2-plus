@@ -4,20 +4,23 @@ import gradio as gr
 
 from shared.utils.plugins import WAN2GPPlugin
 
-from .h3_patch import NO_LORA, apply_patches, build_sigmas, describe, load_config, save_config
+from .h3_patch import DRAFT_SCALE_MAX, DRAFT_SCALE_MIN, NO_LORA, apply_patches, describe, load_config, save_config
 
 PlugIn_Name = "H3 Phase 2+"
 PlugIn_Id = "H3Phase2Plus"
 H3_LORA_MODEL_TYPE = "minimax_h3_ref2va_pruned"
+# Bigger phase 1 (~0.4 MP for a 640p-720p output) so small faces get more pixels, then a light
+# 2-step refine that stays close to it (ComfyUI beta, denoise 0.2 at shift 12 starts at 0.63).
+BIGGER_DRAFT = {"draft_scale": 1.5, "steps": 2, "start_noise": 0.63}
 
 
 class H3Phase2PlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "1.0.0"
+        self.version = "1.1.0"
         self.description = ("Controls the second phase of MiniMax H3 'Two Phases' latent-upscale generation: "
-                            "choose the phase-2 LoRA and strength, the number of steps and the start noise.")
+                            "choose the phase-1 draft size, the phase-2 LoRA and strength, the number of steps and the start noise.")
 
     def setup_ui(self):
         apply_patches()
@@ -40,13 +43,14 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
     def create_ui(self):
         config = load_config()
 
-        def preview(enabled, lora, strength, steps, start_noise, shift):
-            return describe({"enabled": enabled, "lora": lora or NO_LORA, "lora_strength": strength,
+        def preview(enabled, draft_scale, lora, strength, steps, start_noise, shift):
+            return describe({"enabled": enabled, "draft_scale": draft_scale, "lora": lora or NO_LORA, "lora_strength": strength,
                              "steps": int(steps), "start_noise": start_noise, "shift": shift})
 
-        def save(enabled, lora, strength, steps, start_noise, shift):
-            new_config = {"enabled": bool(enabled), "lora": lora or NO_LORA, "lora_strength": float(strength),
-                          "steps": int(steps), "start_noise": float(start_noise), "shift": float(shift)}
+        def save(enabled, draft_scale, lora, strength, steps, start_noise, shift):
+            new_config = {"enabled": bool(enabled), "draft_scale": float(draft_scale), "lora": lora or NO_LORA,
+                          "lora_strength": float(strength), "steps": int(steps), "start_noise": float(start_noise),
+                          "shift": float(shift)}
             if new_config["lora"] != NO_LORA and not os.path.isfile(os.path.join(self._lora_dir(), new_config["lora"])):
                 gr.Warning(f"{new_config['lora']} is not in {self._lora_dir()}; generation will fail until it is.")
             save_config(new_config)
@@ -55,8 +59,11 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
 
         def reset():
             from .h3_patch import DEFAULTS
-            return (DEFAULTS["enabled"], DEFAULTS["lora"], DEFAULTS["lora_strength"], DEFAULTS["steps"],
-                    DEFAULTS["start_noise"], DEFAULTS["shift"])
+            return (DEFAULTS["enabled"], DEFAULTS["draft_scale"], DEFAULTS["lora"], DEFAULTS["lora_strength"],
+                    DEFAULTS["steps"], DEFAULTS["start_noise"], DEFAULTS["shift"])
+
+        def bigger_draft():
+            return BIGGER_DRAFT["draft_scale"], BIGGER_DRAFT["steps"], BIGGER_DRAFT["start_noise"]
 
         with gr.Column():
             gr.Markdown(
@@ -69,6 +76,9 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
                 "To keep your look LoRAs active in phase 2, give them a two-value multiplier in the main tab, e.g. `0.7;0.7`."
             )
             enabled = gr.Checkbox(label="Enable H3 Phase 2+", value=config["enabled"])
+            draft_scale = gr.Slider(label="Phase 1 draft scale: phase 1 = output size / this. WanGP default 2.0; "
+                                          "lower = bigger phase 1, better-formed small faces, slower phase 1",
+                                    minimum=DRAFT_SCALE_MIN, maximum=DRAFT_SCALE_MAX, step=0.05, value=config["draft_scale"])
             with gr.Row():
                 lora = gr.Dropdown(label="Phase 2 LoRA (from loras/minimax_h3)", choices=self._lora_choices(config["lora"]),
                                    value=config["lora"], scale=4)
@@ -82,11 +92,13 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
             summary = gr.Markdown(describe(config))
             with gr.Row():
                 save_btn = gr.Button("Save", variant="primary")
+                bigger_btn = gr.Button("Load 'bigger draft' settings")
                 reset_btn = gr.Button("Reset to defaults")
 
-        inputs = [enabled, lora, strength, steps, start_noise, shift]
+        inputs = [enabled, draft_scale, lora, strength, steps, start_noise, shift]
         for component in inputs:
             component.change(preview, inputs=inputs, outputs=[summary], show_progress="hidden")
         refresh.click(lambda current: gr.update(choices=self._lora_choices(current)), inputs=[lora], outputs=[lora])
         save_btn.click(save, inputs=inputs, outputs=[summary])
         reset_btn.click(reset, outputs=inputs)
+        bigger_btn.click(bigger_draft, outputs=[draft_scale, steps, start_noise])

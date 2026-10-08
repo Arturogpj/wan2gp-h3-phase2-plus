@@ -7,7 +7,7 @@ start of each generation, so changes in the plugin tab apply without a restart.
 - ``MiniMaxH3Pipeline.get_loras_transformer``: inject the chosen phase-2 LoRA
   (phase 1 multiplier 0) instead of the forced LightX2V v0.1 Turbo LoRA.
 - ``MiniMaxH3Pipeline.generate``: swap in a ComfyUI-style phase-2 sigma schedule
-  (start noise, step count, shift) for the duration of one call.
+  (start noise, step count, shift) and the phase-1 draft scale for the duration of one call.
 - ``update_loras_slists``: when phase 2 starts, set the chosen LoRA's multiplier
   and mute any other Turbo LoRA so accelerators never stack.
 """
@@ -30,7 +30,10 @@ DEFAULTS = {
     "steps": 4,
     "start_noise": 0.80,
     "shift": 12.0,
+    # Phase 1 renders at output size / draft_scale. 2.0 is WanGP's built-in ratio.
+    "draft_scale": 2.0,
 }
+DRAFT_SCALE_MIN, DRAFT_SCALE_MAX = 1.25, 2.0
 
 _lock = threading.RLock()
 _patched = False
@@ -53,6 +56,7 @@ def load_config():
     config["steps"] = max(1, min(20, int(config["steps"])))
     config["start_noise"] = max(0.05, min(0.999, float(config["start_noise"])))
     config["shift"] = max(1.0, float(config["shift"]))
+    config["draft_scale"] = max(DRAFT_SCALE_MIN, min(DRAFT_SCALE_MAX, float(config["draft_scale"])))
     return config
 
 
@@ -77,12 +81,19 @@ def build_sigmas(start_noise, steps, shift):
     return tuple(sigmas)
 
 
+def draft_size(width, height, draft_scale):
+    """Phase-1 size WanGP renders for a given output size (same rounding as pipeline.py)."""
+    return max(32, round(width / draft_scale / 32) * 32), max(32, round(height / draft_scale / 32) * 32)
+
+
 def describe(config):
     if not config["enabled"]:
         return "Disabled: WanGP's built-in phase 2 is used (3 steps, forced LightX2V v0.1 Turbo at 1.0)."
     sigmas = build_sigmas(config["start_noise"], config["steps"], config["shift"])
     lora = "no LoRA" if config["lora"] == NO_LORA else f"{config['lora']} @ {config['lora_strength']:g}"
-    return f"Phase 2: {config['steps']} steps, sigmas {' -> '.join(f'{s:.3f}' for s in sigmas)}, {lora}."
+    examples = ", ".join("{}x{} -> {}x{}".format(w, h, *draft_size(w, h, config["draft_scale"])) for w, h in ((1152, 640), (1280, 720)))
+    return (f"Phase 1 at output / {config['draft_scale']:g} (e.g. {examples}). "
+            f"Phase 2: {config['steps']} steps, sigmas {' -> '.join(f'{s:.3f}' for s in sigmas)}, {lora}.")
 
 
 def _basename(lora):
@@ -122,8 +133,9 @@ def apply_patches():
                 return original_generate(self, *args, **kwargs)
             sigmas = build_sigmas(config["start_noise"], config["steps"], config["shift"])
             with _lock:
-                previous_sigmas = pipeline.H3_PHASE_2_SIGMAS
+                previous_sigmas, previous_scale = pipeline.H3_PHASE_2_SIGMAS, pipeline.H3_TWO_PHASE_SCALE
                 pipeline.H3_PHASE_2_SIGMAS = sigmas
+                pipeline.H3_TWO_PHASE_SCALE = config["draft_scale"]
                 kwargs["switch_threshold"] = sigmas[0]
                 _run.update(active=True, lora=None if config["lora"] == NO_LORA else config["lora"].lower(),
                             strength=config["lora_strength"], loras_selected=kwargs.get("loras_selected"))
@@ -131,7 +143,7 @@ def apply_patches():
                 try:
                     return original_generate(self, *args, **kwargs)
                 finally:
-                    pipeline.H3_PHASE_2_SIGMAS = previous_sigmas
+                    pipeline.H3_PHASE_2_SIGMAS, pipeline.H3_TWO_PHASE_SCALE = previous_sigmas, previous_scale
                     _run.update(active=False, lora=None, loras_selected=None)
 
         def update_loras_slists(trans, slists_dict, num_inference_steps, phase_switch_step=None, phase_switch_step2=None):
