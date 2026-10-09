@@ -9,6 +9,7 @@ Controls MiniMax H3 **Two Phases** generation (phase 1 at reduced resolution, la
 | Phase 2 steps | 3 | 4 |
 | Start noise | 0.9035 (slider min 0.7) | 0.80, adjustable down to 0.30 |
 | Schedule | 0.90 → 0.63 → 0.32 → 0 | ComfyUI "simple" at shift 12: 0.80 → 0.735 → 0.632 → 0.444 → 0 |
+| Latent upscale | 16-latent-frame chunks | Whole clip in one pass (cross-faded segments if out of VRAM) |
 | Phase 2 LoRA | LightX2V FL2V Turbo v0.1, forced to 1.0 | Any LoRA in `loras/minimax_h3` (default `lightx2v_hybrid-4to8step-Turbo_r48` at 0.7), or None |
 
 Defaults mirror the ComfyUI workflow *Minimax H3 Cinematic Version* (stage 2: BasicScheduler simple, 4 steps, denoise 0.25).
@@ -23,6 +24,15 @@ Press **Load 'bigger draft' settings**, then **Save**. It sets:
 Your LoRA choice is left as it is. Phase 1 gets slower (about 1.8x the pixels of the default); phase 2 gets cheaper (2 steps instead of 3-4, smaller upscale). If faces still drift in phase 2, lower start noise; if they stay soft, raise it.
 
 The idea is the same two-pass method used in ComfyUI H3 workflows that render a ~0.4 MP draft and refine it after the 3D latent upscaler.
+
+## Flashes every ~2.3 seconds: single-pass upscale
+WanGP upscales the phase-1 latent in chunks of 16 latent frames (about 2.3 s each) to save VRAM. The upscaler's GroupNorm layers compute their statistics over each chunk, so neighbouring chunks come out with slightly different brightness or colour. Phase 2 keeps part of the upscaled latent, so each join can survive as a one- or two-frame flash at fixed times (about 2.3 s, 4.5 s, 6.8 s, ...) whatever the scene.
+
+**Single-pass latent upscale** (on by default) runs the whole clip through the upscaler at once, so there are no joins. It needs more VRAM than the chunks (roughly 5-6 GB for a 1920x1088 output of about 14 s; less for smaller or shorter outputs). If the GPU runs out of memory, the plugin prints a line in the console and falls back to segments for that generation, but with 4 frames of context on each side (WanGP uses 2) and a linear cross-fade where they overlap instead of a hard cut, so any difference between segments fades in over a few frames instead of flashing. It works whether or not the phase-2 overrides above are enabled.
+
+The plugin's lower start noise (0.80 vs WanGP's 0.9035) keeps more of the upscaled latent in phase 2, which is why the joins were more visible with it enabled.
+
+Credit: the diagnosis, the fix and its render tests (1920x1088, 345 frames, RTX 4090: no flash at any former join) are by **MOUGE**.
 
 ## Install
 1. In WanGP open the **Plugins** tab, paste `https://github.com/Arturogpj/wan2gp-h3-phase2-plus` into the install-from-URL box and install.
@@ -44,4 +54,4 @@ The console prints `[H3 Phase 2 Plus] Phase 1 at ... Phase 2: ...` at the start 
 - WanGP's *Phase 2 Noise Level Start* slider is ignored while the plugin is enabled.
 
 ## How
-`h3_patch.py` wraps `MiniMaxH3Pipeline.get_loras_transformer`, `MiniMaxH3Pipeline.generate` and `update_loras_slists` in `models/minimax_h3/pipeline.py` at startup. If a WanGP update renames those, WanGP prints an "Error in setup_ui" line for this plugin at startup instead of silently ignoring it.
+`h3_patch.py` wraps `MiniMaxH3Pipeline.get_loras_transformer`, `MiniMaxH3Pipeline.generate` and `update_loras_slists` in `models/minimax_h3/pipeline.py`, and `MiniMaxH3LatentUpscaler.forward` in `models/minimax_h3/latent_upscaler.py`, at startup. If a WanGP update renames those, WanGP prints an "Error in setup_ui" line for this plugin at startup instead of silently ignoring it.

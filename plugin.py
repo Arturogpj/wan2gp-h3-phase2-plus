@@ -18,9 +18,10 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "1.1.0"
+        self.version = "1.2.0"
         self.description = ("Controls the second phase of MiniMax H3 'Two Phases' latent-upscale generation: "
-                            "choose the phase-1 draft size, the phase-2 LoRA and strength, the number of steps and the start noise.")
+                            "choose the phase-1 draft size, the phase-2 LoRA and strength, the number of steps and the start noise, "
+                            "and upscale the latent in one pass to remove flashes at chunk joins.")
 
     def setup_ui(self):
         apply_patches()
@@ -43,14 +44,14 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
     def create_ui(self):
         config = load_config()
 
-        def preview(enabled, draft_scale, lora, strength, steps, start_noise, shift):
+        def preview(enabled, draft_scale, lora, strength, steps, start_noise, shift, single_pass_upscale):
             return describe({"enabled": enabled, "draft_scale": draft_scale, "lora": lora or NO_LORA, "lora_strength": strength,
-                             "steps": int(steps), "start_noise": start_noise, "shift": shift})
+                             "steps": int(steps), "start_noise": start_noise, "shift": shift, "single_pass_upscale": single_pass_upscale})
 
-        def save(enabled, draft_scale, lora, strength, steps, start_noise, shift):
+        def save(enabled, draft_scale, lora, strength, steps, start_noise, shift, single_pass_upscale):
             new_config = {"enabled": bool(enabled), "draft_scale": float(draft_scale), "lora": lora or NO_LORA,
                           "lora_strength": float(strength), "steps": int(steps), "start_noise": float(start_noise),
-                          "shift": float(shift)}
+                          "shift": float(shift), "single_pass_upscale": bool(single_pass_upscale)}
             if new_config["lora"] != NO_LORA and not os.path.isfile(os.path.join(self._lora_dir(), new_config["lora"])):
                 gr.Warning(f"{new_config['lora']} is not in {self._lora_dir()}; generation will fail until it is.")
             save_config(new_config)
@@ -60,7 +61,7 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
         def reset():
             from .h3_patch import DEFAULTS
             return (DEFAULTS["enabled"], DEFAULTS["draft_scale"], DEFAULTS["lora"], DEFAULTS["lora_strength"],
-                    DEFAULTS["steps"], DEFAULTS["start_noise"], DEFAULTS["shift"])
+                    DEFAULTS["steps"], DEFAULTS["start_noise"], DEFAULTS["shift"], DEFAULTS["single_pass_upscale"])
 
         def bigger_draft():
             return BIGGER_DRAFT["draft_scale"], BIGGER_DRAFT["steps"], BIGGER_DRAFT["start_noise"]
@@ -87,6 +88,10 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
             steps = gr.Slider(label="Phase 2 steps", minimum=1, maximum=12, step=1, value=config["steps"])
             start_noise = gr.Slider(label="Phase 2 start noise (sigma). 0.80 = ComfyUI denoise 0.25 at shift 12; lower keeps more of phase 1",
                                     minimum=0.30, maximum=0.99, step=0.005, value=config["start_noise"])
+            single_pass_upscale = gr.Checkbox(
+                label="Single-pass latent upscale: removes the brief flashes every ~2.3 s caused by WanGP upscaling in "
+                      "16-frame chunks. Needs more VRAM; falls back to cross-faded segments if the GPU runs out of memory",
+                value=config["single_pass_upscale"])
             with gr.Accordion("Advanced", open=False):
                 shift = gr.Number(label="Schedule shift (H3 default 12)", value=config["shift"], minimum=1.0)
             summary = gr.Markdown(describe(config))
@@ -95,7 +100,7 @@ class H3Phase2PlusPlugin(WAN2GPPlugin):
                 bigger_btn = gr.Button("Load 'bigger draft' settings")
                 reset_btn = gr.Button("Reset to defaults")
 
-        inputs = [enabled, draft_scale, lora, strength, steps, start_noise, shift]
+        inputs = [enabled, draft_scale, lora, strength, steps, start_noise, shift, single_pass_upscale]
         for component in inputs:
             component.change(preview, inputs=inputs, outputs=[summary], show_progress="hidden")
         refresh.click(lambda current: gr.update(choices=self._lora_choices(current)), inputs=[lora], outputs=[lora])

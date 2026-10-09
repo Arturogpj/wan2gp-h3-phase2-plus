@@ -1,8 +1,9 @@
 """Runtime overrides for MiniMax H3 two-phase (latent upscale) generation.
 
 Nothing in WanGP's own files is modified. At plugin load we wrap three names in
-``models.minimax_h3.pipeline``; every value is re-read from ``config.json`` at the
-start of each generation, so changes in the plugin tab apply without a restart.
+``models.minimax_h3.pipeline`` and the latent upscaler's ``forward``; every value is
+re-read from ``config.json`` at the start of each generation, so changes in the plugin
+tab apply without a restart.
 
 - ``MiniMaxH3Pipeline.get_loras_transformer``: inject the chosen phase-2 LoRA
   (phase 1 multiplier 0) instead of the forced LightX2V v0.1 Turbo LoRA.
@@ -10,11 +11,18 @@ start of each generation, so changes in the plugin tab apply without a restart.
   (start noise, step count, shift) and the phase-1 draft scale for the duration of one call.
 - ``update_loras_slists``: when phase 2 starts, set the chosen LoRA's multiplier
   and mute any other Turbo LoRA so accelerators never stack.
+- ``MiniMaxH3LatentUpscaler.forward``: run the whole clip in one pass instead of
+  16-latent-frame chunks. Its GroupNorm layers normalize over time, so each chunk got
+  its own statistics and the joins showed up as one- or two-frame flashes about every
+  2.3 s. If the GPU runs out of memory, falls back to cross-faded segments
+  (``crossfaded_upscale``). Diagnosis and fix design by MOUGE.
 """
 
 import json
 import os
 import threading
+
+import torch
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(PLUGIN_DIR, "config.json")
@@ -32,6 +40,8 @@ DEFAULTS = {
     "shift": 12.0,
     # Phase 1 renders at output size / draft_scale. 2.0 is WanGP's built-in ratio.
     "draft_scale": 2.0,
+    # Upscale the whole clip at once (no chunk seams); chunked fallback on out-of-memory.
+    "single_pass_upscale": True,
 }
 DRAFT_SCALE_MIN, DRAFT_SCALE_MAX = 1.25, 2.0
 
@@ -51,6 +61,7 @@ def load_config():
     except Exception as error:
         print(f"[H3 Phase 2 Plus] Could not read {CONFIG_PATH}, using defaults: {error}")
     config["enabled"] = bool(config["enabled"])
+    config["single_pass_upscale"] = bool(config["single_pass_upscale"])
     config["lora"] = str(config["lora"] or NO_LORA)
     config["lora_strength"] = float(config["lora_strength"])
     config["steps"] = max(1, min(20, int(config["steps"])))
@@ -87,13 +98,60 @@ def draft_size(width, height, draft_scale):
 
 
 def describe(config):
+    upscale = (" Latent upscale: single pass (cross-faded segments if out of memory)." if config.get("single_pass_upscale", True)
+               else " Latent upscale: WanGP's 16-frame chunks.")
     if not config["enabled"]:
-        return "Disabled: WanGP's built-in phase 2 is used (3 steps, forced LightX2V v0.1 Turbo at 1.0)."
+        return "Disabled: WanGP's built-in phase 2 is used (3 steps, forced LightX2V v0.1 Turbo at 1.0)." + upscale
     sigmas = build_sigmas(config["start_noise"], config["steps"], config["shift"])
     lora = "no LoRA" if config["lora"] == NO_LORA else f"{config['lora']} @ {config['lora_strength']:g}"
     examples = ", ".join("{}x{} -> {}x{}".format(w, h, *draft_size(w, h, config["draft_scale"])) for w, h in ((1152, 640), (1280, 720)))
     return (f"Phase 1 at output / {config['draft_scale']:g} (e.g. {examples}). "
-            f"Phase 2: {config['steps']} steps, sigmas {' -> '.join(f'{s:.3f}' for s in sigmas)}, {lora}.")
+            f"Phase 2: {config['steps']} steps, sigmas {' -> '.join(f'{s:.3f}' for s in sigmas)}, {lora}." + upscale)
+
+
+def crossfaded_upscale(model, latent, scale, target_size=None, abort_callback=None, progress_callback=None):
+    """Out-of-memory fallback for the latent upscaler (design by MOUGE).
+
+    Same segments as WanGP, but each one gets chunk/4 frames of context on both sides
+    (WanGP uses 2) and neighbours are blended with a linear cross-fade over their overlap
+    instead of a hard cut, so per-segment GroupNorm differences fade in instead of flashing.
+    """
+    from models.minimax_h3.latent_upscaler import _check_abort
+
+    frames = latent.shape[2]
+    if target_size is None:
+        target_size = (frames, int(round(latent.shape[-2] * float(scale))), int(round(latent.shape[-1] * float(scale))))
+    _, height, width = (int(size) for size in target_size)
+    chunk = model.temporal_chunk_size
+    context = max(1, chunk // 4)
+    starts = range(0, frames, chunk)
+    total_steps = len(starts) * (len(model.in_blocks) + len(model.out_blocks) + 3)
+    step = 0
+
+    def advance():
+        nonlocal step
+        if callable(progress_callback):
+            progress_callback("Latent network", step, total_steps)
+        step += 1
+
+    device = latent.device
+    fade = (torch.arange(2 * context, dtype=torch.float32, device=device) + 0.5) / (2 * context)
+    output = torch.zeros(latent.shape[0], latent.shape[1], frames, height, width, dtype=torch.float32, device=device)
+    weight_sum = torch.zeros(frames, dtype=torch.float32, device=device)
+    for start in starts:
+        _check_abort(abort_callback)
+        low, high = max(0, start - context), min(frames, start + chunk + context)
+        segment = model._forward_segment(latent[:, :, low:high], scale, (high - low, height, width), abort_callback, advance)
+        weights = torch.ones(high - low, dtype=torch.float32, device=device)
+        ramp = min(2 * context, high - low)
+        if low > 0:  # fade in over the overlap with the previous segment
+            weights[:ramp] = fade[:ramp]
+        if high < frames:  # fade out over the overlap with the next segment
+            weights[-ramp:] = torch.minimum(weights[-ramp:], fade.flip(0)[-ramp:])
+        output[:, :, low:high] += segment.float() * weights.view(1, 1, -1, 1, 1)
+        weight_sum[low:high] += weights
+        segment = None
+    return output.div_(weight_sum.view(1, 1, -1, 1, 1)).to(latent.dtype)
 
 
 def _basename(lora):
@@ -106,10 +164,13 @@ def apply_patches():
         if _patched:
             return
         from models.minimax_h3 import pipeline
+        from models.minimax_h3.latent_upscaler import MiniMaxH3LatentUpscaler
 
         original_get_loras = pipeline.MiniMaxH3Pipeline.get_loras_transformer
         original_generate = pipeline.MiniMaxH3Pipeline.generate
         original_update_slists = pipeline.update_loras_slists
+        original_upscale = MiniMaxH3LatentUpscaler.forward
+        out_of_memory = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
 
         def get_loras_transformer(self, *args, **kwargs):
             model_def = kwargs.get("model_def") or {}
@@ -160,8 +221,27 @@ def apply_patches():
                     slists_dict["shared"][index] = False
             return original_update_slists(trans, slists_dict, num_inference_steps, phase_switch_step=phase_switch_step, phase_switch_step2=phase_switch_step2)
 
+        def upscale(self, latent, scale, target_size=None, abort_callback=None, progress_callback=None):
+            args = (latent, scale, target_size, abort_callback, progress_callback)
+            if not load_config()["single_pass_upscale"] or latent.shape[2] <= self.temporal_chunk_size:
+                return original_upscale(self, *args)
+            chunk_size = self.temporal_chunk_size
+            try:
+                self.temporal_chunk_size = latent.shape[2]
+                return original_upscale(self, *args)
+            except out_of_memory:
+                pass
+            finally:
+                self.temporal_chunk_size = chunk_size
+            # Only reached after an out-of-memory; retrying outside the except block releases the failed attempt's tensors first.
+            torch.cuda.empty_cache()
+            print(f"[H3 Phase 2 Plus] Not enough VRAM to upscale {latent.shape[2]} latent frames in one pass; "
+                  f"using cross-faded {chunk_size}-frame segments instead.")
+            return crossfaded_upscale(self, *args)
+
         pipeline.MiniMaxH3Pipeline.get_loras_transformer = get_loras_transformer
         pipeline.MiniMaxH3Pipeline.generate = generate
         pipeline.update_loras_slists = update_loras_slists
+        MiniMaxH3LatentUpscaler.forward = upscale
         _patched = True
         print(f"[H3 Phase 2 Plus] Active. {describe(load_config())}")
